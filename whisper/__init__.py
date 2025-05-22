@@ -97,7 +97,8 @@ def _download(url: str, root: str, in_memory: bool) -> Union[bytes, str]:
 
 def available_models() -> List[str]:
     """Returns the names of available models"""
-    return list(_MODELS.keys())
+    # Return a copy to prevent accidental modification of the cached list
+    return _MODEL_NAMES.copy()
 
 
 def load_model(
@@ -158,3 +159,5 @@ def load_model(
         model.set_alignment_heads(alignment_heads)
 
     return model.to(device)
+
+_MODEL_NAMES = list(_MODELS.keys())
