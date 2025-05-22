@@ -327,59 +327,107 @@ class BeamSearchDecoder(TokenDecoder):
             raise ValueError(f"{tokens.shape}[0] % {self.beam_size} != 0")
 
         n_audio = tokens.shape[0] // self.beam_size
-        if self.finished_sequences is None:  # for the first update
+        device = tokens.device
+        if self.finished_sequences is None:
             self.finished_sequences = [{} for _ in range(n_audio)]
 
+        # one log_softmax for all beams in batch
         logprobs = F.log_softmax(logits.float(), dim=-1)
-        next_tokens, source_indices, finished_sequences = [], [], []
+        # Get topk probs and tokens for each beam
+        # logprobs: [n_beams, vocab], topk: [n_beams, bsz], topk_indices: [n_beams, bsz]
+        topk_logprobs, topk_tokens = logprobs.topk(self.beam_size + 1, dim=-1)
+
+        beam_range = torch.arange(tokens.shape[0], device=device)
+        # expand sums to match topk for clean vector add, then flatten for easier later steps
+        expanded_sum_logprobs = sum_logprobs.unsqueeze(-1).expand(-1, self.beam_size + 1)
+        candidate_logprobs = topk_logprobs + expanded_sum_logprobs  # [n_beams, beam_size+1]
+
+        # Avoid slow tolist(): keep as numpy or torch tensors!
+        # Each beam expands to (beam_size+1) candidates
+        beam_size_plus = self.beam_size + 1
+
+        # Flatten for easy slicing
+        # new_tokens: [n_beams * (beam_size+1), token_length+1]
+        old_token_len = tokens.shape[1]
+        candidate_tokens = tokens.unsqueeze(1).expand(-1, beam_size_plus, -1)
+        candidate_tokens = candidate_tokens.reshape(-1, old_token_len)  # [n_beams*beam_size+, len]
+        expanded_topk_tokens = topk_tokens.reshape(-1, 1)
+        # concat efficiently
+        candidate_tokens = torch.cat([candidate_tokens, expanded_topk_tokens], dim=1)  # append
+
+        candidate_logprobs = candidate_logprobs.reshape(-1)
+        beam_src_indices = beam_range.repeat_interleave(beam_size_plus)  # which origin beam
+        candidate_tokens_list = candidate_tokens.tolist()  # unavoidable for dict as Python keys
+
+        # Group candidates for each audio
+        next_tokens = []
+        source_indices = []
+        finished_sequences = []
+        sumlogprob_buffer = torch.empty(self.beam_size * n_audio, dtype=sum_logprobs.dtype, device=device)
+        candidate_idx = 0
+
         for i in range(n_audio):
-            scores, sources, finished = {}, {}, {}
+            # Slice region for this audio
+            # Each audio has self.beam_size beams, each beam has beam_size+1 expansion, so total expansions per audio:
+            start = i * self.beam_size * beam_size_plus
+            end = (i + 1) * self.beam_size * beam_size_plus
 
-            # STEP 1: calculate the cumulative log probabilities for possible candidates
-            for j in range(self.beam_size):
-                idx = i * self.beam_size + j
-                prefix = tokens[idx].tolist()
-                for logprob, token in zip(*logprobs[idx].topk(self.beam_size + 1)):
-                    new_logprob = (sum_logprobs[idx] + logprob).item()
-                    sequence = tuple(prefix + [token.item()])
-                    scores[sequence] = new_logprob
-                    sources[sequence] = idx
+            region_scores = candidate_logprobs[start:end]
+            region_tokens = candidate_tokens_list[start:end]
+            region_sources = beam_src_indices[start:end]
 
-            # STEP 2: rank the candidates and keep the top beam_size sequences for each audio
+            # Only use python dict for the small region per audio.
+            scores_dict = {}
+            sources_dict = {}
+            finished_dict = {}
+
+            for idx, (seq, score) in enumerate(zip(region_tokens, region_scores)):
+                t_seq = tuple(seq)
+                scores_dict[t_seq] = score.item()
+                sources_dict[t_seq] = region_sources[idx].item()
+
+            # Get top sequences fast: sort dict by value descending
+            sorted_seqs = sorted(scores_dict, key=scores_dict.get, reverse=True)
             saved = 0
-            for sequence in sorted(scores, key=scores.get, reverse=True):
-                if sequence[-1] == self.eot:
-                    finished[sequence] = scores[sequence]
+            for seq in sorted_seqs:
+                if seq[-1] == self.eot:
+                    finished_dict[seq] = scores_dict[seq]
                 else:
-                    sum_logprobs[len(next_tokens)] = scores[sequence]
-                    next_tokens.append(sequence)
-                    source_indices.append(sources[sequence])
+                    # Save to batched output
+                    sumlogprob_buffer[len(next_tokens)] = scores_dict[seq]
+                    next_tokens.append(seq)
+                    source_indices.append(sources_dict[seq])
 
                     saved += 1
                     if saved == self.beam_size:
                         break
+            finished_sequences.append(finished_dict)
 
-            finished_sequences.append(finished)
+        # Reduce sum_logprobs inplace, avoid repeatedly reallocating
+        sum_logprobs[:len(next_tokens)] = sumlogprob_buffer[:len(next_tokens)]
 
-        tokens = torch.tensor(next_tokens, device=tokens.device)
+        # vectorized conversion to tensor for batch
+        tokens_out = torch.tensor(next_tokens, dtype=tokens.dtype, device=device)
         self.inference.rearrange_kv_cache(source_indices)
 
-        # add newly finished sequences to self.finished_sequences
+        # add finished sequences
         assert len(self.finished_sequences) == len(finished_sequences)
         for previously_finished, newly_finished in zip(
             self.finished_sequences, finished_sequences
         ):
-            for seq in sorted(newly_finished, key=newly_finished.get, reverse=True):
-                if len(previously_finished) >= self.max_candidates:
-                    break  # the candidate list is full
-                previously_finished[seq] = newly_finished[seq]
+            if newly_finished:
+                # sorted insert, as before
+                for seq in sorted(newly_finished, key=newly_finished.get, reverse=True):
+                    if len(previously_finished) >= self.max_candidates:
+                        break
+                    previously_finished[seq] = newly_finished[seq]
 
         # mark as completed if all audio has enough number of samples
         completed = all(
             len(sequences) >= self.max_candidates
             for sequences in self.finished_sequences
         )
-        return tokens, completed
+        return tokens_out, completed
 
     def finalize(self, preceding_tokens: Tensor, sum_logprobs: Tensor):
         # collect all finished sequences, including patience, and add unfinished ones if not enough
