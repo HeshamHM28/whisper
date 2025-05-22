@@ -18,38 +18,48 @@ if TYPE_CHECKING:
 
 def median_filter(x: torch.Tensor, filter_width: int):
     """Apply a median filter of width `filter_width` along the last dimension of `x`"""
+    # Early-outs and fast shape logic
     pad_width = filter_width // 2
+    ndim = x.ndim
+
     if x.shape[-1] <= pad_width:
-        # F.pad requires the padding width to be smaller than the input dimension
+        # If filter is wider than array, return as-is
         return x
 
-    if (ndim := x.ndim) <= 2:
-        # `F.pad` does not support 1D or 2D inputs for reflect padding but supports 3D and 4D
-        x = x[None, None, :]
+    # Efficiently handle <=2D input by reshaping instead of slicing for less overhead
+    restore_shape = None
+    if ndim <= 2:
+        orig_shape = x.shape
+        x = x.reshape((1, 1) + orig_shape)
+        restore_shape = orig_shape
 
-    assert (
-        filter_width > 0 and filter_width % 2 == 1
-    ), "`filter_width` should be an odd number"
+    assert filter_width > 0 and filter_width % 2 == 1, \
+        "`filter_width` should be an odd number"
+
+    # Compute only once
+    pad = (pad_width, pad_width, 0, 0)
+    x_padded = F.pad(x, pad, mode="reflect")
 
     result = None
-    x = F.pad(x, (filter_width // 2, filter_width // 2, 0, 0), mode="reflect")
-    if x.is_cuda:
+    # CUDA path
+    if x_padded.is_cuda:
         try:
             from .triton_ops import median_filter_cuda
-
-            result = median_filter_cuda(x, filter_width)
+            result = median_filter_cuda(x_padded, filter_width)
         except (RuntimeError, subprocess.CalledProcessError):
             warnings.warn(
                 "Failed to launch Triton kernels, likely due to missing CUDA toolkit; "
                 "falling back to a slower median kernel implementation..."
             )
 
+    # Fallback, CPU/other
     if result is None:
-        # sort() is faster than torch.median (https://github.com/pytorch/pytorch/issues/51450)
-        result = x.unfold(-1, filter_width, 1).sort()[0][..., filter_width // 2]
+        # `sort` is more efficient than median
+        result = x_padded.unfold(-1, filter_width, 1).sort()[0][..., filter_width // 2]
 
-    if ndim <= 2:
-        result = result[0, 0]
+    # (Efficiently) squeeze result shape back if input was <=2D
+    if restore_shape is not None:
+        result = result.reshape(restore_shape)
 
     return result
 
